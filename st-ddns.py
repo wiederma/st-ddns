@@ -9,12 +9,13 @@ from subprocess import run
 import shlex
 import logging
 import requests
-import urllib3
 
 
 # We do the pinning ourselves; we don't need a monkey
 # who warns us all the time that we are not safe...
-urllib3.disable_warnings()
+# http://stackoverflow.com/a/28002687
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # fingerprint pinning to host
 pinning = (
@@ -65,9 +66,15 @@ def _chunk_str(s, chunk_size):
     return [s[i:i+chunk_size] for i in range(0, len(s), chunk_size)]
 
 
-def _hash_cert(cert):
+def _hash_cert_bin(cert):
     v = ssl.PEM_cert_to_DER_cert(cert)
     return sha256(v).digest()
+
+
+def _hash_cert_file(path):
+    logging.debug('Reading certificate: {}'.format(path))
+    with open(path) as f:
+        return _hash_cert_bin(f.read())
 
 
 def calc_device_id(barray):
@@ -79,7 +86,7 @@ def calc_device_id(barray):
 
 def verify_host(host, exp_fp):
     cert = ssl.get_server_certificate((host, 443))
-    fp = calc_device_id(_hash_cert(cert))
+    fp = calc_device_id(_hash_cert_bin(cert))
     if fp == exp_fp:
         return True
     return False
@@ -89,6 +96,12 @@ def verify_host(host, exp_fp):
 # Commands
 #
 def cmd_announce(args):
+    cert = shlex.quote(args.cert)
+    key = shlex.quote(args.key)
+
+    logging.debug('Using certificate: {}'.format(cert))
+    logging.debug('Using key: {}'.format(key))
+
     for mapping in pinning:
         disco_url = 'https://' + mapping[0] + '/v2/' + '?id=' + mapping[1]
         payload = {'addresses': ['tcp://:12345']}
@@ -101,7 +114,7 @@ def cmd_announce(args):
                 disco_url,
                 json=payload,
                 verify=False,
-                cert=(shlex.quote(args.cert), shlex.quote(args.key)),
+                cert=(cert, key),
             )
 
         # requests does logging through the enabled logging module
@@ -112,21 +125,19 @@ def cmd_announce(args):
 
         if r.status_code != 204:
             logging.info('Announce failed')
+            logging.debug(r.text)
             continue
 
 
 def cmd_request(args):
-    device_id = ''
-
-    with open(args.cert) as f:
-        device_id = calc_device_id(_hash_cert(f.read()))
-
+    device_id = calc_device_id(_hash_cert_file(args.cert))
     request_url = 'https://announce.syncthing.net/v2/'
 
     # FIXME: Use urljoin and friends here.
     r = requests.get(request_url + '?device=' + device_id, verify=False)
-    if r.status_code != 204:
-        print('No device found!')
+    if r.status_code != 200:
+        logging.info('No device found!')
+        logging.debug(r.text)
         exit(1)
 
     ip = r.text.split(':')[5].rsplit('/')[2]
@@ -136,6 +147,7 @@ def cmd_request(args):
 def cmd_gencert(args):
     run([
         'openssl',
+        'req',
         '-x509',
         '-newkey',
         'rsa:4096',
@@ -148,8 +160,7 @@ def cmd_gencert(args):
 
 
 def cmd_fingerprint(args):
-    with open(args.cert) as f:
-        device_id = calc_device_id(_hash_cert(f.read()))
+    device_id = calc_device_id(_hash_cert_file(args.cert))
     print(device_id)
 
 
@@ -185,8 +196,8 @@ def parse_args():
         '-l',
         metavar='LEVEL',
         type=str,
-        default='INFO',
-        help='CRITICAL, ERROR, WARNING, INFO [default], DEBUG'
+        default='WARNING',
+        help='CRITICAL, ERROR, WARNING [default], INFO, DEBUG'
     )
 
     subparsers = parser.add_subparsers()
@@ -229,6 +240,7 @@ def parse_args():
 def main():
     args = parse_args()
     logging_init(args.l)
+    logging.debug('Invoked with args: {}'.format(args))
 
     if hasattr(args, 'func'):
         args.func(args)
