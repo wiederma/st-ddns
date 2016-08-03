@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 
+import argparse
+import base64
 import ssl
+import sys
 from hashlib import sha256
+from subprocess import run
+import shlex
+import logging
 import requests
-from deviceID import get_device_id
+import urllib3
+
+
+# We do the pinning ourselves; we don't need a monkey
+# who warns us all the time that we are not safe...
+urllib3.disable_warnings()
 
 # fingerprint pinning to host
 pinning = (
@@ -34,19 +45,52 @@ pinning = (
 )
 
 
+def _luhn_mod_sum(s):
+    # https://en.wikipedia.org/wiki/Luhn_mod_N_algorithm
+    a = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+    n = len(a)
+    factor = 1
+    k = 0
+    for i in s:
+        addend = factor * a.index(i)
+        factor = 1 if factor == 2 else 2
+        addend = (addend // n) + (addend % n)
+        k += addend
+    remainder = k % n
+    check_codepoint = (n - remainder) % n
+    return a[check_codepoint]
+
+
+def _chunk_str(s, chunk_size):
+    return [s[i:i+chunk_size] for i in range(0, len(s), chunk_size)]
+
+
+def _hash_cert(cert):
+    v = ssl.PEM_cert_to_DER_cert(cert)
+    return sha256(v).digest()
+
+
+def calc_device_id(barray):
+    s = ''.join([chr(a) for a in base64.b32encode(barray)][:52])
+    c = _chunk_str(s, 13)
+    k = ''.join(['%s%s' % (cc, _luhn_mod_sum(cc)) for cc in c])
+    return '-'.join(_chunk_str(k, 7))
+
+
 def verify_host(host, exp_fp):
     cert = ssl.get_server_certificate((host, 443))
-    v = ssl.PEM_cert_to_DER_cert(cert)
-    digest = sha256(v).digest()
-    fp = get_device_id(digest)
+    fp = calc_device_id(_hash_cert(cert))
     if fp == exp_fp:
         return True
     return False
 
 
-def announce():
+#
+# Commands
+#
+def cmd_announce(args):
     for mapping in pinning:
-        disco_url = 'https://' + mapping[0]
+        disco_url = 'https://' + mapping[0] + '/v2/' + '?id=' + mapping[1]
         payload = {'addresses': ['tcp://:12345']}
 
         try:
@@ -57,44 +101,137 @@ def announce():
                 disco_url,
                 json=payload,
                 verify=False,
-                # TODO: Make this configurable
-                cert=('./cert.pem', './key.pem'),
+                cert=(shlex.quote(args.cert), shlex.quote(args.key)),
             )
-        # verify_host() raises OSError
+
+        # requests does logging through the enabled logging module
         except OSError:
-            # TODO: Log a warning
             continue
         except requests.exceptions.ConnectionError:
-            # TODO: Log a warning here
             continue
 
         if r.status_code != 204:
-            # TODO: Log a warning
+            logging.info('Announce failed')
             continue
 
-        reannounce_time = r.headers['Reannounce-After']
-        print(reannounce_time)
 
-
-def request():
+def cmd_request(args):
     device_id = ''
 
-    with open('./cert.pem') as f:
-        v = ssl.PEM_cert_to_DER_cert(f.read())
-        digest = sha256(v).digest()
-        device_id = get_device_id(digest)
+    with open(args.cert) as f:
+        device_id = calc_device_id(_hash_cert(f.read()))
 
     request_url = 'https://announce.syncthing.net/v2/'
 
     # FIXME: Use urljoin and friends here.
     r = requests.get(request_url + '?device=' + device_id, verify=False)
+    if r.status_code != 204:
+        print('No device found!')
+        exit(1)
+
     ip = r.text.split(':')[5].rsplit('/')[2]
     print(ip)
 
 
+def cmd_gencert(args):
+    run([
+        'openssl',
+        '-x509',
+        '-newkey',
+        'rsa:4096',
+        '-keyout',
+        'key.pem',
+        '-out',
+        'cert.pem',
+        '-nodes',
+    ])
+
+
+def cmd_fingerprint(args):
+    with open(args.cert) as f:
+        device_id = calc_device_id(_hash_cert(f.read()))
+    print(device_id)
+
+
+def logging_init(loglevel):
+    # From python docs. No magic stackoverflow involved. :)
+    # https://docs.python.org/3/howto/logging.html#logging-to-a-file
+    numeric_level = getattr(logging, loglevel.upper(), None)
+    if not isinstance(numeric_level, int):
+        print('Invalid log level: "{}"'.format(loglevel))
+        exit(1)
+
+    logging.basicConfig(
+        format='%(asctime)s %(levelname)s: %(message)s',
+        level=numeric_level,
+    )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '-c',
+        '--cert',
+        default='./cert.pem',
+        help='Use this certificate [default: ./cert.pem]',
+    )
+    parser.add_argument(
+        '-k',
+        '--key',
+        default='./key.pem',
+        help='Use this private key [default: ./key.pem]',
+    )
+    parser.add_argument(
+        '-l',
+        metavar='LEVEL',
+        type=str,
+        default='INFO',
+        help='CRITICAL, ERROR, WARNING, INFO [default], DEBUG'
+    )
+
+    subparsers = parser.add_subparsers()
+    parser_announce = subparsers.add_parser(
+        'announce',
+        aliases=('ann',),
+        help='Announce IP to the Syncthing discovery system',
+    )
+    parser_announce.set_defaults(func=cmd_announce)
+
+    parser_request = subparsers.add_parser(
+        'request',
+        aliases=('req',),
+        help='Query the ip of a given device',
+    )
+    parser_request.add_argument('ID')
+    parser_request.set_defaults(func=cmd_request)
+
+    parser_gencert = subparsers.add_parser(
+        'gencert',
+        aliases=('gc',),
+        help='Generate a certificate',
+    )
+    parser_gencert.set_defaults(func=cmd_gencert)
+
+    parser_fingerprint = subparsers.add_parser(
+        'fingerprint',
+        aliases=('fp',),
+        help='Print the fingerprint of a given certificate',
+    )
+    parser_fingerprint.add_argument(
+        'cert',
+        help='The path to the certificate file',
+    )
+    parser_fingerprint.set_defaults(func=cmd_fingerprint)
+
+    return parser.parse_args()
+
+
 def main():
-    announce()
-    # request()
+    args = parse_args()
+    logging_init(args.l)
+
+    if hasattr(args, 'func'):
+        args.func(args)
 
 
 if __name__ == '__main__':
